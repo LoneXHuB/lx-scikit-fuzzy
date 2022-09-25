@@ -3,7 +3,8 @@ fuzzy_ops.py : Package of general operations on fuzzy sets, fuzzy membership
                functions, and their associated universe variables.
 """
 import numpy as np
-
+import torch
+from torch import Tensor
 
 def cartadd(x, y):
     """
@@ -560,15 +561,107 @@ def interp_membership(x, xmf, xx, zero_outside_x=True):
     consider a new value x = xx, which does not correspond to any discrete
     values of ``x``. This function computes the membership value ``u(xx)``
     corresponding to the value ``xx`` using linear interpolation.
-
-    """
+"""
     # Not much beats NumPy's built-in interpolation
     if not zero_outside_x:
         kwargs = (None, None)
     else:
         kwargs = (0.0, 0.0)
-    return np.interp(xx, x, xmf, left=kwargs[0], right=kwargs[1])
+    
+    res =  np.interp(xx, x, xmf)
+    return res
 
+
+from numba import jit, cuda
+import cupy as cp
+def interp_cuda(x : cp.ndarray, xmf : cp.ndarray, xx : cp.ndarray, zero_outside_x=True):
+    # Nothing beats cuda
+    if not zero_outside_x:
+        kwargs = (None, None)
+    else:
+        kwargs = (0.0, 0.0)
+    
+    res = cp.interp(xx, x, xmf)
+    return res
+
+
+def interp_membership_lx(x, xmf, xx, zero_outside_x =True ):
+    # Not much beats NumPy's built-in interpolation
+    if not zero_outside_x:
+        kwargs = (None, None)
+    else:
+        kwargs = (0.0, 0.0)
+    
+    res =  cp.interp(xx, x, xmf)
+    return res
+
+
+@jit(target_backend ="cuda")
+def interp_torch_lx(x , xx , xmf , indecies):
+    #indecies = torch.floor(x).long()
+    #indecies = torch.clamp(indecies, 0. , len(xx)-2)
+    x1s = xx[indecies]
+    x2s = xx[indecies+1]
+    y1s = xmf[indecies]
+    y2s = xmf[indecies+1]
+
+    return y1s + (x - x1s) * (y2s-y1s) / (x2s - x1s)
+#bad
+def interp_torch(x: Tensor, xi: Tensor, yi: Tensor) -> Tensor:
+    """One-dimensional linear interpolation for monotonically increasing sample
+    points.
+
+    Returns the one-dimensional piecewise linear interpolant to a function with
+    given discrete data points :math:`(xi, yi)`, evaluated at :math:`x`.
+
+    Args:
+        x: the :math:`x`-coordinates at which to evaluate the interpolated
+            values.
+        xi: the :math:`x`-coordinates of the data points, must be increasing.
+        yi: the :math:`y`-coordinates of the data points, same length as `xi`.
+
+    Returns:
+        the interpolated values, same size as `x`.
+    """
+    m = (yi[1:] - yi[:-1]) / (xi[1:] - xi[:-1])
+    b = yi[:-1] - (m * xi[:-1])
+
+    indicies = torch.sum(torch.ge(x[:, None], xi[None, :]), 1) - 1
+    indicies = torch.clamp(indicies, 0, len(m) - 1)
+
+    return m[indicies] * x + b[indicies]
+
+from itertools import product
+#very bad
+def interp_torch2(points, values, points_to_interp):
+    n = len(points)
+
+    idxs = []
+    dists = []
+    overalls = []
+    for p, x in zip(points, points_to_interp):
+        idx_right = torch.bucketize(x, p)
+        idx_right[idx_right >= p.shape[0]] = p.shape[0] - 1
+        idx_left = (idx_right - 1).clamp(0, p.shape[0] - 1)
+        dist_left = x - p[idx_left]
+        dist_right = p[idx_right] - x
+        dist_left[dist_left < 0] = 0.
+        dist_right[dist_right < 0] = 0.
+        both_zero = (dist_left == 0) & (dist_right == 0)
+        dist_left[both_zero] = dist_right[both_zero] = 1.
+
+        idxs.append((idx_left, idx_right))
+        dists.append((dist_left, dist_right))
+        overalls.append(dist_left + dist_right)
+
+    numerator = 0.
+    for indexer in product([0, 1], repeat=n):
+        as_s = [idx[onoff] for onoff, idx in zip(indexer, idxs)]
+        bs_s = [dist[1 - onoff] for onoff, dist in zip(indexer, dists)]
+        numerator += values[as_s] * \
+            torch.prod(torch.stack(bs_s), dim=0)
+    denominator = torch.prod(torch.stack(overalls), dim=0)
+    return numerator / denominator
 
 def interp_universe(x, xmf, y):
     """
